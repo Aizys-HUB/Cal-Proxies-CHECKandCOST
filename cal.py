@@ -21,7 +21,7 @@ def parse_proxy(r):
 class HydraFinal:
     def __init__(self, root):
         self.root = root
-        self.root.title("HYDRA V2 | ADVANCED SAVE & CONTROL")
+        self.root.title("HYDRA PROXIES")
         self.root.configure(bg="#0A0A0A")
         
         self.is_running = False
@@ -38,7 +38,7 @@ class HydraFinal:
         self.toggle_input()
 
     def setup_ui(self):
-        tk.Label(self.root, text="HYDRA V2: MASTER BUILD", font=("Courier", 16, "bold"), bg="#0A0A0A", fg="#00FF00").pack(pady=10)
+        tk.Label(self.root, text="HYDRA Proxy Checks", font=("Courier", 16, "bold"), bg="#0A0A0A", fg="#00FF00").pack(pady=10)
 
         example_frame = tk.Frame(self.root, bg="#111", padx=10, pady=5)
         example_frame.pack(fill="x", padx=40, pady=5)
@@ -153,7 +153,7 @@ class HydraFinal:
             for p, _ in self.alive_list:
                 f.write(f"{p}\n")
             f.write("\n" + "="*40 + "\n")
-            f.write(f"HYDRA V2 - SESSION LOG SUMMARY\n")
+            f.write(f"HYDRA  - SESSION LOG SUMMARY\n")
             f.write(f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"STATUS: {'PAUSED' if self.is_paused else ('COMPLETED' if not self.is_running else 'RUNNING')}\n")
             f.write(f"TOTAL CHECKED: {self.total_count}\n")
