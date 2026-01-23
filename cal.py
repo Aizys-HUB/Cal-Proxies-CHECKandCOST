@@ -3,11 +3,147 @@ from tkinter import messagebox, filedialog, ttk
 import requests, time, os, threading, shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import json
 
 # --- Core Logic ---
 def get_live_rate():
     try: return requests.get("https://open.er-api.com/v6/latest/USD", timeout=2).json()['rates']['THB']
     except: return 36.50
+
+TARGET_PRESETS = {
+    "Google (Standard)": {
+        "url": "http://google.com/generate_204",
+        "purpose": "stability/latency",
+        "method": "GET",
+    },
+    "HttpBin (Anonymity)": {
+        "url": "https://httpbin.org/get",
+        "purpose": "connectivity + anonymity check",
+        "method": "GET",
+    },
+    "IP-API (Geolocation)": {
+        "url": "http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query",
+        "purpose": "connectivity + geo info",
+        "method": "GET",
+    },
+    "Amazon (Target Test)": {
+        "url": "https://www.amazon.com/robots.txt",
+        "purpose": "anti-bot / blacklist smoke test",
+        "method": "GET",
+    },
+    "Custom URL": {
+        "url": "",
+        "purpose": "custom",
+        "method": "GET",
+    },
+}
+
+def check_anonymous(proxy_url):
+    """ตรวจสอบว่า proxy เป็น anonymous หรือไม่"""
+    try:
+        with requests.Session() as sess:
+            sess.proxies = {"http": proxy_url, "https": proxy_url}
+            # ใช้บริการที่ตรวจสอบ headers
+            resp = sess.get("http://httpbin.org/headers", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                headers = data.get('headers', {})
+                # ตรวจสอบว่ามี X-Forwarded-For, X-Real-Ip, หรือ Via headers หรือไม่
+                # ถ้ามี headers เหล่านี้ แสดงว่า proxy ไม่ anonymous
+                if 'X-Forwarded-For' in headers or 'X-Real-Ip' in headers or 'Via' in headers:
+                    return False, "Transparent"
+                return True, "Anonymous"
+    except:
+        pass
+    return None, "Unknown"
+
+def get_geo_info(proxy_url):
+    """ตรวจสอบ Geo (ประเทศ) ของ proxy"""
+    try:
+        with requests.Session() as sess:
+            sess.proxies = {"http": proxy_url, "https": proxy_url}
+            # ใช้ ip-api.com (free, no API key needed)
+            resp = sess.get("http://ip-api.com/json/?fields=status,country,countryCode,city,isp", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'success':
+                    country = data.get('country', 'Unknown')
+                    country_code = data.get('countryCode', '')
+                    city = data.get('city', '')
+                    isp = data.get('isp', '')
+                    return {
+                        'country': country,
+                        'country_code': country_code,
+                        'city': city,
+                        'isp': isp
+                    }
+    except:
+        pass
+    return {'country': 'Unknown', 'country_code': '', 'city': '', 'isp': ''}
+
+def test_target(sess, target_key, custom_url=""):
+    """
+    ทดสอบ proxy กับ target ที่เลือก
+    return: (ok: bool, status_code: int|None, extra: dict)
+    """
+    preset = TARGET_PRESETS.get(target_key) or TARGET_PRESETS["Google (Standard)"]
+    url = (custom_url or "").strip() if target_key == "Custom URL" else preset.get("url", "")
+    if not url:
+        return False, None, {"error": "empty_target_url"}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+    try:
+        resp = sess.get(url, timeout=6, headers=headers, allow_redirects=True)
+        extra = {"target_url": url}
+
+        # Google: 204 is ideal, but <400 is fine
+        if target_key == "Google (Standard)":
+            extra["google_status"] = resp.status_code
+            return (resp.status_code < 400), resp.status_code, extra
+
+        # HttpBin: connectivity here; anonymity checked separately via /headers
+        if target_key == "HttpBin (Anonymity)":
+            extra["httpbin_status"] = resp.status_code
+            return (resp.status_code == 200), resp.status_code, extra
+
+        # IP-API: if success, we can extract geo directly from response
+        if target_key == "IP-API (Geolocation)":
+            extra["ipapi_status"] = resp.status_code
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        extra.update({
+                            "country": data.get("country", "Unknown"),
+                            "country_code": data.get("countryCode", ""),
+                            "city": data.get("city", ""),
+                            "isp": data.get("isp", ""),
+                            "exit_ip": data.get("query", ""),
+                        })
+                        return True, resp.status_code, extra
+                except:
+                    pass
+            return False, resp.status_code, extra
+
+        # Amazon: very rough anti-bot smoke test (robots.txt is lightweight)
+        if target_key == "Amazon (Target Test)":
+            extra["amazon_status"] = resp.status_code
+            body = (resp.text or "")[:5000].lower()
+            is_captcha = ("captcha" in body) or ("robot check" in body) or ("enter the characters you see" in body)
+            is_block = resp.status_code in (403, 429, 503) or is_captcha
+            extra["amazon_blocked"] = bool(is_block)
+            extra["amazon_signal"] = "captcha" if is_captcha else ("status_block" if resp.status_code in (403, 429, 503) else "ok")
+            return (not is_block and resp.status_code < 400), resp.status_code, extra
+
+        # Custom URL: consider <400 ok
+        extra["custom_status"] = resp.status_code
+        return (resp.status_code < 400), resp.status_code, extra
+    except Exception as e:
+        return False, None, {"target_url": url, "error": str(e)}
 
 def parse_proxy(r):
     r = r.strip()
@@ -46,6 +182,33 @@ class HydraFinal:
         example_text = "socks5://1.1.1.1:20001\nsocks4://1.1.1.1:46527\nhttp://1.1.1.1:443:user:pass\nhttp://1.1.1.1:80"
         tk.Label(example_frame, text=example_text, font=("Consolas", 8), bg="#111", fg="#777", justify="left").pack(anchor="w")
 
+        # --- Target Selection ---
+        target_frame = tk.Frame(self.root, bg="#0A0A0A")
+        target_frame.pack(fill="x", padx=40, pady=8)
+        tk.Label(target_frame, text="TARGET URL", bg="#0A0A0A", fg="#00FF00", font=("Courier", 9, "bold")).pack(anchor="w")
+
+        row = tk.Frame(target_frame, bg="#0A0A0A")
+        row.pack(fill="x")
+        self.target_var = tk.StringVar(value="Google (Standard)")
+        self.target_combo = ttk.Combobox(row, textvariable=self.target_var, state="readonly",
+                                         values=list(TARGET_PRESETS.keys()))
+        self.target_combo.pack(side="left", fill="x", expand=True)
+
+        self.custom_target_var = tk.StringVar(value="")
+        self.entry_custom_target = tk.Entry(row, textvariable=self.custom_target_var, font=("Courier", 10),
+                                            bg="#1A1A1A", fg="white", borderwidth=0)
+        self.entry_custom_target.pack(side="left", padx=8, fill="x", expand=True)
+
+        def _on_target_change(_evt=None):
+            # Show custom entry only when needed
+            is_custom = (self.target_var.get() == "Custom URL")
+            self.entry_custom_target.configure(state=("normal" if is_custom else "disabled"))
+            if not is_custom:
+                self.custom_target_var.set("")
+
+        self.target_combo.bind("<<ComboboxSelected>>", _on_target_change)
+        _on_target_change()
+
         self.mode = tk.IntVar(value=1)
         self.f_mode = tk.Frame(self.root, bg="#0A0A0A"); self.f_mode.pack(pady=5)
         self.rb_manual = tk.Radiobutton(self.f_mode, text="Manual IP", variable=self.mode, value=1, command=self.toggle_input, bg="#0A0A0A", fg="white", selectcolor="#333")
@@ -66,7 +229,7 @@ class HydraFinal:
         f_alive.pack(side="left", fill="both", expand=True, padx=5)
         self.lbl_alive_count = tk.Label(f_alive, text="ALIVE: 0", bg="#0A0A0A", fg="#00FF00", font=("Courier", 12, "bold"))
         self.lbl_alive_count.pack()
-        self.alive_box = tk.Text(f_alive, height=10, width=45, bg="#050505", fg="#00FF00", font=("Consolas", 8), borderwidth=1, relief="flat")
+        self.alive_box = tk.Text(f_alive, height=10, width=60, bg="#050505", fg="#00FF00", font=("Consolas", 8), borderwidth=1, relief="flat")
         self.alive_box.pack(fill="both", expand=True)
         tk.Button(f_alive, text="💾 SAVE & LOG RESULT", command=self.save_alive_to_file, bg="#004400", fg="white", font=("Tahoma", 8, "bold")).pack(fill="x", pady=2)
 
@@ -105,13 +268,18 @@ class HydraFinal:
         self.res_label = tk.Label(self.root, text="RPS: -\nBW: -\nDURATION: -\nCOST: -", bg="#0A0A0A", fg="#00FF00", font=("Courier", 11, "bold"), justify="left")
         self.res_label.pack()
         
-        self.root.geometry("800x950")
+        self.root.geometry("1000x950")
 
     def lock_ui(self, locked=True):
         state = "disabled" if locked else "normal"
         self.rb_manual.config(state=state); self.rb_file.config(state=state)
         self.entry_manual.config(state=state); self.btn_upload.config(state=state)
         self.btn_check.config(state=state)
+        self.target_combo.config(state=("disabled" if locked else "readonly"))
+        if self.target_var.get() == "Custom URL":
+            self.entry_custom_target.config(state=("disabled" if locked else "normal"))
+        else:
+            self.entry_custom_target.config(state="disabled")
         for k in self.ins:
             if k != "L": self.ins[k].config(state=state)
 
@@ -150,8 +318,30 @@ class HydraFinal:
         f = filedialog.asksaveasfile(mode='w', defaultextension=".txt", filetypes=[("Text files", "*.txt")])
         if f:
             f.write("--- ALIVE PROXIES LIST ---\n")
-            for p, _ in self.alive_list:
-                f.write(f"{p}\n")
+            f.write(f"{'Proxy':<50} {'Latency':<10} {'Target':<18} {'T-OK':<5} {'T-Status':<8} {'Anonymous':<12} {'Country':<20} {'City':<20} {'ISP':<30} {'ExitIP':<16} {'AMZ':<8}\n")
+            f.write("-" * 150 + "\n")
+            for item in self.alive_list:
+                if len(item) >= 3:
+                    p, avg, data = item[0], item[1], item[2]
+                    anon_str = "Yes" if data.get('anonymous') else ("No" if data.get('anonymous') is False else "Unknown")
+                    country = data.get('country', 'Unknown')
+                    city = data.get('city', '')
+                    isp = data.get('isp', '')
+                    tgt = data.get("target", "")
+                    tok = "Y" if data.get("target_ok") is True else ("N" if data.get("target_ok") is False else "")
+                    tsc = str(data.get("target_status") or "")
+                    exit_ip = data.get("exit_ip", "") or ""
+                    amz = ""
+                    if data.get("target") == "Amazon (Target Test)":
+                        if data.get("amazon_blocked") is True:
+                            amz = "BLOCKED"
+                        elif data.get("amazon_blocked") is False:
+                            amz = "OK"
+                    f.write(f"{p:<50} {avg:.3f}s{'':<5} {tgt:<18} {tok:<5} {tsc:<8} {anon_str:<12} {country:<20} {city:<20} {isp:<30} {exit_ip:<16} {amz:<8}\n")
+                else:
+                    # สำหรับข้อมูลเก่าที่ไม่มี geo info
+                    p, avg = item[0], item[1]
+                    f.write(f"{p:<50} {avg:.3f}s{'':<5} {'':<18} {'':<5} {'':<8} {'Unknown':<12} {'Unknown':<20} {'':<20} {'':<30} {'':<16} {'':<8}\n")
             f.write("\n" + "="*40 + "\n")
             f.write(f"HYDRA  - SESSION LOG SUMMARY\n")
             f.write(f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -159,6 +349,28 @@ class HydraFinal:
             f.write(f"TOTAL CHECKED: {self.total_count}\n")
             f.write(f"ALIVE: {len(self.alive_list)}\n")
             f.write(f"DEAD: {self.dead_count}\n")
+            f.write(f"TARGET: {self.target_var.get()}\n")
+            if self.target_var.get() == "Custom URL":
+                f.write(f"CUSTOM URL: {self.custom_target_var.get().strip()}\n")
+            
+            # สรุปข้อมูล Geo
+            if self.alive_list and len(self.alive_list[0]) >= 3:
+                countries = {}
+                anonymous_count = 0
+                for item in self.alive_list:
+                    if len(item) >= 3:
+                        data = item[2]
+                        country = data.get('country', 'Unknown')
+                        countries[country] = countries.get(country, 0) + 1
+                        if data.get('anonymous'):
+                            anonymous_count += 1
+                
+                f.write("\n" + "="*40 + "\n")
+                f.write("GEO SUMMARY:\n")
+                for country, count in sorted(countries.items(), key=lambda x: x[1], reverse=True):
+                    f.write(f"  {country}: {count} proxies\n")
+                f.write(f"\nAnonymous Proxies: {anonymous_count}/{len(self.alive_list)}\n")
+            
             f.write("="*40 + "\n")
             f.close()
             messagebox.showinfo("Success", "บันทึกเรียบร้อยแล้ว!")
@@ -189,6 +401,16 @@ class HydraFinal:
             return
         self.progress["value"] = 0; self.progress["maximum"] = len(raw)
         checked = 0
+        target_key = self.target_var.get()
+        custom_url = self.custom_target_var.get().strip()
+        target_short = {
+            "Google (Standard)": "GGL",
+            "HttpBin (Anonymity)": "HBN",
+            "IP-API (Geolocation)": "GEO",
+            "Amazon (Target Test)": "AMZ",
+            "Custom URL": "CUS",
+        }.get(target_key, "TGT")
+
         with ThreadPoolExecutor(max_workers=int(self.ins['T'].get())) as exe:
             def check(p):
                 nonlocal checked
@@ -200,19 +422,93 @@ class HydraFinal:
                 try:
                     with requests.Session() as sess:
                         sess.proxies = {"http": u, "https": u}
+                        # warm up: nothing, but keep consistent session
                         for _ in range(3):
                             if self.stop_requested: break
                             try:
                                 st = time.time()
-                                if sess.get("http://google.com/generate_204", timeout=4).status_code < 400: s.append(time.time()-st)
+                                ok, _, _ = test_target(sess, target_key, custom_url=custom_url)
+                                if ok:
+                                    s.append(time.time()-st)
                             except: break
                 except: pass
                 checked += 1; self.total_count = checked
                 if not self.stop_requested:
                     if len(s)==3:
                         avg = sum(s)/3
-                        self.alive_list.append((p, avg))
-                        self.alive_box.insert(tk.END, f"[{now}] [SUCCESS] {p} | {avg:.3f}s\n")
+                        # ตรวจสอบ anonymous / geo ตาม target ที่เลือก
+                        is_anon, anon_type = (None, "Unknown")
+                        geo_info = {'country': 'Unknown', 'country_code': '', 'city': '', 'isp': ''}
+                        target_info = {}
+                        try:
+                            with requests.Session() as sess2:
+                                sess2.proxies = {"http": u, "https": u}
+                                # target-specific enrichment
+                                ok2, sc2, extra2 = test_target(sess2, target_key, custom_url=custom_url)
+                                target_info = {"target": target_key, "target_ok": ok2, "target_status": sc2}
+                                target_info.update(extra2 if isinstance(extra2, dict) else {})
+
+                                if target_key == "HttpBin (Anonymity)":
+                                    is_anon, anon_type = check_anonymous(u)
+                                elif target_key == "IP-API (Geolocation)":
+                                    # prefer parsed data from IP-API call if present; fallback to old function
+                                    if extra2 and extra2.get("country") and extra2.get("country") != "Unknown":
+                                        geo_info = {
+                                            "country": extra2.get("country", "Unknown"),
+                                            "country_code": extra2.get("country_code", ""),
+                                            "city": extra2.get("city", ""),
+                                            "isp": extra2.get("isp", ""),
+                                        }
+                                    else:
+                                        geo_info = get_geo_info(u)
+                                elif target_key == "Amazon (Target Test)":
+                                    # also keep basic geo for display
+                                    geo_info = get_geo_info(u)
+                                else:
+                                    # default: keep both checks like before (useful overall)
+                                    is_anon, anon_type = check_anonymous(u)
+                                    geo_info = get_geo_info(u)
+                        except:
+                            pass
+
+                        country = geo_info.get('country', 'Unknown')
+                        country_code = geo_info.get('country_code', '')
+                        city = geo_info.get('city', '')
+                        
+                        # สร้างข้อมูลสำหรับแสดงผล
+                        anon_status = "ANON" if is_anon else ("TRANS" if anon_type == "Transparent" else "UNK")
+                        country_display = f"{country} ({country_code})" if country_code else country
+                        if city:
+                            country_display += f" - {city}"
+                        
+                        # เก็บข้อมูลทั้งหมด
+                        proxy_data = {
+                            'proxy': p,
+                            'latency': avg,
+                            'anonymous': is_anon,
+                            'anon_type': anon_type,
+                            'country': country,
+                            'country_code': country_code,
+                            'city': city,
+                            'isp': geo_info.get('isp', '')
+                        }
+                        proxy_data.update(target_info)
+                        self.alive_list.append((p, avg, proxy_data))
+                        
+                        # แสดงผลในกล่องข้อความ
+                        tgt_badge = target_short
+                        if target_key == "Amazon (Target Test)" and isinstance(target_info, dict):
+                            if target_info.get("amazon_blocked") is True:
+                                tgt_badge = f"{target_short}:BLK"
+                            elif target_info.get("target_ok") is True:
+                                tgt_badge = f"{target_short}:OK"
+                        elif isinstance(target_info, dict) and target_info.get("target_ok") is True:
+                            tgt_badge = f"{target_short}:OK"
+                        elif isinstance(target_info, dict) and target_info.get("target_ok") is False:
+                            tgt_badge = f"{target_short}:NO"
+
+                        display_text = f"[{now}] [{tgt_badge}] [{anon_status}] {country_display} | {avg:.3f}s\n  {p}\n"
+                        self.alive_box.insert(tk.END, display_text)
                         self.lbl_alive_count.config(text=f"ALIVE: {len(self.alive_list)}")
                     else:
                         self.dead_count += 1
@@ -220,7 +516,7 @@ class HydraFinal:
                         self.lbl_dead_count.config(text=f"DEAD: {self.dead_count}")
                     self.alive_box.see(tk.END); self.dead_box.see(tk.END)
                     self.progress["value"] = checked
-                    self.lbl_status.config(text=f"Checking: {checked}/{len(raw)}")
+                    self.lbl_status.config(text=f"Checking ({target_short}): {checked}/{len(raw)}")
             list(exe.map(check, raw))
 
         self.prog_container.pack_forget(); self.is_running = False
@@ -233,7 +529,22 @@ class HydraFinal:
             self.ins['L'].configure(bg="#004400", fg="#00FF00") 
             self.ins['L'].config(state='readonly')
             self.calculate()
-            self.lbl_status.config(text=f"DONE: {len(self.alive_list)} ALIVE", fg="#00FF00")
+            
+            # แสดงสรุปข้อมูล Geo
+            if len(self.alive_list) > 0 and len(self.alive_list[0]) >= 3:
+                countries = {}
+                anonymous_count = 0
+                for item in self.alive_list:
+                    if len(item) >= 3:
+                        data = item[2]
+                        country = data.get('country', 'Unknown')
+                        countries[country] = countries.get(country, 0) + 1
+                        if data.get('anonymous'):
+                            anonymous_count += 1
+                top_countries = ", ".join([f"{k}({v})" for k, v in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:3]])
+                self.lbl_status.config(text=f"DONE: {len(self.alive_list)} ALIVE | ANON: {anonymous_count} | Top: {top_countries}", fg="#00FF00")
+            else:
+                self.lbl_status.config(text=f"DONE: {len(self.alive_list)} ALIVE", fg="#00FF00")
         else:
             self.lbl_status.config(text="STOPPED" if self.stop_requested else "FAILED", fg="orange")
 
